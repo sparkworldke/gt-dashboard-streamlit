@@ -14,12 +14,6 @@ DB_PATH = "gt_sfa.db"
 LPPC_TARGET = 4.0
 ABV_TARGET = 2000.0
 PRODUCTIVITY_TARGET = 50.0
-MILL_MONTHLY_TARGET = 5000000.0 # Default placeholder
-MILL_KEYWORDS = ["Tishu Poa", "Cosy Poa", "Sifa", "Cosy", "Fay Wipes"]
-KIMFAY_BRANDS = [
-    "SIFA", "TISSUE POA", "TISHU POA", "FAY", "COSY POA", 
-    "FAY WET TISSUE (BIG PACK)", "FAY WET WIPES", "COSY"
-]
 
 # =========================================================
 # HELPERS
@@ -62,23 +56,6 @@ def detect_value_column(df):
         if "VALUE" in col.upper() and "SOLD" in col.upper():
             return col
     return None
-
-def detect_quantity_column(df):
-    for col in df.columns:
-        if "QTY" in col.upper() or "QUANTITY" in col.upper() or "CASES" in col.upper():
-            return col
-    return None
-
-def add_column_if_not_exists(conn, table, column, col_type):
-    try:
-        cur = conn.cursor()
-        cur.execute(f"PRAGMA table_info({table})")
-        cols = [info[1] for info in cur.fetchall()]
-        if column not in cols:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
-            conn.commit()
-    except Exception as e:
-        print(f"Migration error: {e}")
 
 def get_date_range(period):
     today = datetime.today().date()
@@ -145,36 +122,6 @@ def init_db():
     """)
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS mill_products_entries (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        entry_id INTEGER,
-        report_date TEXT,
-        report_date_iso TEXT,
-        sales_rep_id INTEGER,
-        sales_rep_name TEXT,
-        customer_id TEXT,
-        customer_code TEXT,
-        customer_name TEXT,
-        region_name TEXT,
-        product_code TEXT,
-        product_id TEXT,
-        product_name TEXT,
-        product_sku TEXT,
-        brand_name TEXT,
-        value_sold_kes REAL,
-        entry_time_raw TEXT,
-        customer_category TEXT,
-        product_category TEXT
-    );
-    """)
-
-    # Ensure columns exist if table already exists
-    add_column_if_not_exists(conn, "sales_line_entries", "customer_category", "TEXT")
-    add_column_if_not_exists(conn, "sales_line_entries", "product_category", "TEXT")
-    add_column_if_not_exists(conn, "mill_products_entries", "customer_category", "TEXT")
-    add_column_if_not_exists(conn, "mill_products_entries", "product_category", "TEXT")
-
-    cur.execute("""
     CREATE TABLE IF NOT EXISTS daily_orders (
         report_date TEXT,
         report_date_iso TEXT,
@@ -229,12 +176,6 @@ def init_db():
             pass # Already exists
 
     conn.commit()
-    
-    # --- MIGRATIONS ---
-    # Ensure quantity_cases exists
-    add_column_if_not_exists(conn, "sales_line_entries", "quantity_cases", "REAL")
-    add_column_if_not_exists(conn, "mill_products_entries", "quantity_cases", "REAL")
-    
     conn.close()
 
 def date_exists(report_date_iso):
@@ -298,27 +239,7 @@ def insert_file2(df, report_date):
         ]
     ]
 
-    # Add quantity_cases if present (it should be from upload logic)
-    if "quantity_cases" in df.columns:
-        df_subset = df_subset.copy()
-        df_subset["quantity_cases"] = df["quantity_cases"]
-    else:
-        df_subset = df_subset.copy()
-        df_subset["quantity_cases"] = 0.0
-
     conn = get_connection()
-    
-    # Filter for Mill Products
-    # Case insensitive match for any of the keywords in product_name or brand_name
-    pattern = "|".join(MILL_KEYWORDS)
-    mask = df_subset["product_name"].str.contains(pattern, case=False, na=False) | \
-           df_subset["brand_name"].str.contains(pattern, case=False, na=False)
-    
-    df_mill = df_subset[mask]
-    
-    if not df_mill.empty:
-        df_mill.to_sql("mill_products_entries", conn, if_exists="append", index=False)
-
     df_subset.to_sql("sales_line_entries", conn, if_exists="append", index=False)
     conn.close()
 
@@ -416,7 +337,6 @@ conn = get_connection()
 activity_all = pd.read_sql("SELECT * FROM rep_daily_activity", conn)
 orders_all = pd.read_sql("SELECT * FROM daily_orders", conn)
 lines_all = pd.read_sql("SELECT * FROM sales_line_entries", conn)
-mill_all = pd.read_sql("SELECT * FROM mill_products_entries", conn)
 conn.close()
 
 if activity_all.empty:
@@ -426,13 +346,10 @@ if activity_all.empty:
     activity_all = pd.DataFrame(columns=["report_date_iso", "region_name", "sales_rep_name", "customers_on_pjp", "new_customers_mapped", "sales_rep_id", "actual_visits"])
     orders_all = pd.DataFrame(columns=["report_date_iso", "sales_rep_id", "customer_id", "order_value_kes", "lines_count"])
     lines_all = pd.DataFrame(columns=["report_date_iso", "region_name", "sales_rep_name", "product_sku", "product_code", "brand_name", "customer_id", "value_sold_kes"])
-    mill_all = pd.DataFrame(columns=["report_date_iso", "region_name", "sales_rep_name", "product_sku", "product_code", "brand_name", "customer_id", "value_sold_kes"])
 else:
     activity_all["report_date_iso"] = pd.to_datetime(activity_all["report_date_iso"])
     orders_all["report_date_iso"] = pd.to_datetime(orders_all["report_date_iso"])
     lines_all["report_date_iso"] = pd.to_datetime(lines_all["report_date_iso"])
-    if not mill_all.empty:
-        mill_all["report_date_iso"] = pd.to_datetime(mill_all["report_date_iso"])
 
 # =========================================================
 # FILTERS
@@ -507,7 +424,6 @@ def apply_filters(df, date_range=None):
 af = apply_filters(activity_all)
 of = apply_filters(orders_all)
 lf = apply_filters(lines_all)
-mf = apply_filters(mill_all)
 
 def calculate_metrics(af_curr, of_curr):
     customers_pjp = af_curr["customers_on_pjp"].sum()
@@ -539,7 +455,7 @@ def calculate_metrics(af_curr, of_curr):
 # =========================================================
 # TABS
 # =========================================================
-tabs_list = ["📊 Dashboard", "📉 LPPC", "🏭 Mill Products", "👥 Customers", "🧠 Insights"]
+tabs_list = ["📊 Dashboard", "📉 LPPC", "🧠 Insights"]
 if st.session_state.get('role') == 'super_admin':
     tabs_list.append("📥 Upload")
 
@@ -547,10 +463,8 @@ all_tabs = st.tabs(tabs_list)
 
 tab_dashboard = all_tabs[0]
 tab_lppc = all_tabs[1]
-tab_mill = all_tabs[2]
-tab_customers = all_tabs[3]
-tab_insights = all_tabs[4]
-tab_upload = all_tabs[5] if len(all_tabs) > 5 else None
+tab_insights = all_tabs[2]
+tab_upload = all_tabs[3] if len(all_tabs) > 3 else None
 
 # =========================================================
 # DASHBOARD TAB
@@ -956,23 +870,9 @@ with tab_lppc:
                 # Merge with Rep and Region info from af
                 targets = targets.merge(af[["sales_rep_id", "sales_rep_name", "region_name"]].drop_duplicates("sales_rep_id"), on="sales_rep_id", how="left")
                 
-                # Merge with Product Details for 1-Line Orders
-                if not lf.empty:
-                    # distinct lines only to avoid duplication if multiple entries exist for same SKU/Order
-                    prod_details = lf[["report_date_iso", "sales_rep_id", "customer_id", "brand_name", "product_sku", "product_code"]].drop_duplicates()
-                    targets = targets.merge(
-                        prod_details, 
-                        on=["report_date_iso", "sales_rep_id", "customer_id"], 
-                        how="left"
-                    )
-                else:
-                    targets["product_code"] = "-"
-                    targets["product_sku"] = "-"
-                    targets["brand_name"] = "-"
-                
                 if not targets.empty:
                     display_targets = (
-                        targets[["customer_name", "order_value_kes", "region_name", "sales_rep_name", "brand_name", "product_sku", "product_code"]]
+                        targets[["customer_name", "order_value_kes", "region_name", "sales_rep_name"]]
                         .sort_values("order_value_kes", ascending=False)
                         .head(10)
                     )
@@ -982,10 +882,7 @@ with tab_lppc:
                             "customer_name": "Customer", 
                             "order_value_kes": "Value (KES)",
                             "region_name": "Region",
-                            "sales_rep_name": "Rep",
-                            "brand_name": "Brand",
-                            "product_sku": "Product",
-                            "product_code": "Code"
+                            "sales_rep_name": "Rep"
                         })
                         .style.format({"Value (KES)": "{:,.0f}"}),
                         use_container_width=True
@@ -1093,582 +990,6 @@ with tab_lppc:
                  key='download-csv'
              )
 
-
-
-
-
-# =========================================================
-# MILL PRODUCTS TAB
-# =========================================================
-with tab_mill:
-    st.header("🏭 Mill Products Performance")
-    st.caption("Tracking: Tishu Poa, Cosy Poa, Sifa, Cosy, Fay Wipes")
-
-    # --- Backfill Logic ---
-    if mill_all.empty and not lines_all.empty:
-        st.warning("⚠️ Mill Products table appears empty, but sales data exists.")
-        if st.button("Initialize Mill Data from Sales History"):
-            with st.spinner("Analyzing and extracting Mill Products..."):
-                conn = get_connection()
-                pattern = "|".join(MILL_KEYWORDS)
-                
-                # Filter locally to avoid complex SQL regex
-                # Ensure we work with a copy to avoid SettingWithCopyWarning
-                mask = lines_all["product_name"].str.contains(pattern, case=False, na=False) | \
-                       lines_all["brand_name"].str.contains(pattern, case=False, na=False)
-                
-                df_backfill = lines_all[mask].copy()
-                
-                if not df_backfill.empty:
-                    # Fix Date format for SQL (it was converted to datetime on load)
-                    df_backfill["report_date_iso"] = df_backfill["report_date_iso"].dt.strftime("%Y-%m-%d")
-                    
-                    # Drop 'id' to let new table auto-increment
-                    if "id" in df_backfill.columns:
-                        df_backfill = df_backfill.drop(columns=["id"])
-                        
-                    df_backfill.to_sql("mill_products_entries", conn, if_exists="append", index=False)
-                    st.success(f"✅ Successfully imported {len(df_backfill)} records.")
-                    time.sleep(1)
-                    st.rerun()
-                else:
-                    st.warning("No Mill Products found in existing history.")
-                conn.close()
-
-
-    if mf.empty:
-        st.info("No Mill Products data available for the selected filters.")
-    else:
-        # --- Brand Filter ---
-        all_mill_brands = sorted(mf["brand_name"].dropna().unique())
-        selected_mill_brands = st.multiselect("Filter by Brand", all_mill_brands, default=all_mill_brands)
-        
-        if selected_mill_brands:
-            mf = mf[mf["brand_name"].isin(selected_mill_brands)]
-            
-        if mf.empty:
-             st.warning("No data for selected brands.")
-        
-        # Ensure quantity_cases exists in mf
-        if "quantity_cases" not in mf.columns:
-            mf["quantity_cases"] = 0.0
-
-        # --- Targets ---
-        st.markdown("### 🎯 Performance vs Target")
-        
-        t_tab1, t_tab2 = st.tabs(["💰 Sales Targets", "📦 Volume Targets (Cases)"])
-        
-        with t_tab1:
-            col_t1, col_t2 = st.columns([1, 2])
-            with col_t1:
-                target_month = st.number_input("Monthly Sales Target (KES)", value=MILL_MONTHLY_TARGET, step=500000.0)
-            with col_t2:
-                target_week = target_month / 4.0
-                st.metric("Weekly Sales Target", f"{target_week:,.0f}")
-
-        with t_tab2:
-            st.caption("Set Monthly Case Targets per Region")
-            # Get regions
-            all_regions = sorted(mf["region_name"].dropna().unique())
-            if not all_regions: all_regions = ["Region A"]
-            
-            # Init targets in session state if not set
-            if "mill_region_targets" not in st.session_state:
-                st.session_state["mill_region_targets"] = pd.DataFrame({
-                    "Region": all_regions,
-                    "Target Cases": [1000.0] * len(all_regions)
-                })
-            
-            # Sync regions if data changed
-            current_targets = st.session_state["mill_region_targets"]
-            for r in all_regions:
-                if r not in current_targets["Region"].values:
-                    new_row = pd.DataFrame({"Region": [r], "Target Cases": [1000.0]})
-                    current_targets = pd.concat([current_targets, new_row], ignore_index=True)
-            st.session_state["mill_region_targets"] = current_targets
-
-            edited_targets = st.data_editor(
-                st.session_state["mill_region_targets"],
-                num_rows="dynamic",
-                key="region_target_editor",
-                use_container_width=True,
-                column_config={
-                    "Target Cases": st.column_config.NumberColumn(format="%.0f")
-                }
-            )
-            st.session_state["mill_region_targets"] = edited_targets
-            
-            total_case_target = edited_targets["Target Cases"].sum()
-            st.metric("Total Monthly Case Target", f"{total_case_target:,.0f}")
-
-        # --- KPIs ---
-        total_sales_mill = mf["value_sold_kes"].sum()
-        total_cases_mill = mf["quantity_cases"].sum()
-        unique_cust_mill = mf["customer_id"].nunique()
-        
-        col_k1, col_k2, col_k3, col_k4 = st.columns(4)
-        col_k1.metric("Total Sales", f"KES {total_sales_mill:,.0f}")
-        col_k2.metric("Total Cases", f"{total_cases_mill:,.0f}")
-        col_k3.metric("Buying Customers", f"{unique_cust_mill:,.0f}")
-        
-        # Brand Breakdown
-        brand_stats = mf.groupby("brand_name")["value_sold_kes"].sum().sort_values(ascending=False)
-        top_brand = brand_stats.index[0] if not brand_stats.empty else "-"
-        col_k4.metric("Top Brand", top_brand)
-
-        st.markdown("---")
-        
-        # --- WoW & MoM Analysis ---
-        st.subheader("📈 Period Comparisons (WoW & MoM)")
-        
-        # Calculate Date Ranges
-        today = pd.Timestamp.now().date()
-        
-        # This Week (ISO Monday-Sunday)
-        this_week_start = today - pd.Timedelta(days=today.weekday())
-        this_week_end = this_week_start + pd.Timedelta(days=6)
-        
-        # Last Week
-        last_week_start = this_week_start - pd.Timedelta(days=7)
-        last_week_end = last_week_start + pd.Timedelta(days=6)
-        
-        # This Month
-        this_month_start = today.replace(day=1)
-        next_month = (today.replace(day=28) + pd.Timedelta(days=4))
-        this_month_end = next_month - pd.Timedelta(days=next_month.day)
-        
-        # Last Month
-        last_month_end = this_month_start - pd.Timedelta(days=1)
-        last_month_start = last_month_end.replace(day=1)
-        
-        # Helper to get sales for a range respecting Region/Rep (Global) + Brand (Local)
-        def get_period_sales(start, end, brands):
-            # apply_filters handles Region & Rep
-            d = apply_filters(mill_all, date_range=(start, end))
-            if not d.empty and brands:
-                d = d[d["brand_name"].isin(brands)]
-            return d["value_sold_kes"].sum() if not d.empty else 0.0
-
-        sales_this_week = get_period_sales(this_week_start, this_week_end, selected_mill_brands)
-        sales_last_week = get_period_sales(last_week_start, last_week_end, selected_mill_brands)
-        
-        sales_this_month = get_period_sales(this_month_start, this_month_end, selected_mill_brands)
-        sales_last_month = get_period_sales(last_month_start, last_month_end, selected_mill_brands)
-        
-        # Calculate Deltas
-        delta_week = sales_this_week - sales_last_week
-        delta_month = sales_this_month - sales_last_month
-        
-        pct_week = (delta_week / sales_last_week * 100) if sales_last_week > 0 else 0
-        pct_month = (delta_month / sales_last_month * 100) if sales_last_month > 0 else 0
-        
-        # Display
-        cw1, cw2, cw3, cw4 = st.columns(4)
-        cw1.metric("This Week Sales", f"{sales_this_week:,.0f}", f"{pct_week:+.1f}% (vs LW)")
-        cw2.metric("Last Week Sales", f"{sales_last_week:,.0f}")
-        cw3.metric("This Month Sales", f"{sales_this_month:,.0f}", f"{pct_month:+.1f}% (vs LM)")
-        cw4.metric("Last Month Sales", f"{sales_last_month:,.0f}")
-
-        st.markdown("---")
-
-        # --- Charts ---
-        c1, c2 = st.columns(2)
-        
-        with c1:
-            st.subheader("Regional Performance (Cases)")
-            
-            # Merge Actuals with Targets
-            reg_actual = mf.groupby("region_name")["quantity_cases"].sum().reset_index()
-            reg_actual.columns = ["Region", "Actual Cases"]
-            
-            reg_comparison = pd.merge(
-                st.session_state["mill_region_targets"],
-                reg_actual,
-                on="Region",
-                how="outer"
-            )
-            reg_comparison[["Target Cases", "Actual Cases"]] = reg_comparison[["Target Cases", "Actual Cases"]].fillna(0)
-            
-            # Melt for grouped bar chart
-            reg_melted = reg_comparison.melt("Region", var_name="Type", value_name="Cases")
-            
-            c_reg = alt.Chart(reg_melted).mark_bar().encode(
-                x=alt.X('Region', axis=None),
-                y=alt.Y('Cases', title="Cases"),
-                color=alt.Color('Type', scale=alt.Scale(domain=['Actual Cases', 'Target Cases'], range=['#4caf50', '#bdbdbd'])),
-                column=alt.Column('Region', header=alt.Header(titleOrient="bottom", labelOrient="bottom")),
-                tooltip=['Region', 'Type', alt.Tooltip('Cases', format=',.0f')]
-            ).properties(height=300)
-            
-            st.altair_chart(c_reg, use_container_width=True)
-
-        with c2:
-            st.subheader("Brand Performance (Sales)")
-            brand_mill = mf.groupby("brand_name")["value_sold_kes"].sum().reset_index()
-            
-            c_brand = alt.Chart(brand_mill).mark_arc(innerRadius=50).encode(
-                theta=alt.Theta(field="value_sold_kes", type="quantitative"),
-                color=alt.Color(field="brand_name", type="nominal"),
-                tooltip=['brand_name', alt.Tooltip('value_sold_kes', format=',.0f')]
-            ).properties(height=300)
-            st.altair_chart(c_brand, use_container_width=True)
-
-        # --- Weekly Trends ---
-        st.subheader("📅 Weekly Sales Trend")
-        # Group by Week
-        # Using ISO Week
-        mf_trend = mf.copy()
-        mf_trend["Week"] = mf_trend["report_date_iso"].dt.isocalendar().week
-        mf_trend["Year"] = mf_trend["report_date_iso"].dt.year
-        # Combine Year-Week for sorting
-        mf_trend["YearWeek"] = mf_trend["Year"].astype(str) + "-W" + mf_trend["Week"].astype(str)
-        
-        weekly_stats = mf_trend.groupby("YearWeek")["value_sold_kes"].sum().reset_index()
-        
-        # Add Target Line
-        weekly_stats["Target"] = target_week
-        
-        base = alt.Chart(weekly_stats).encode(x=alt.X('YearWeek', title="Week"))
-        
-        bar = base.mark_bar(color="#4caf50").encode(
-            y=alt.Y('value_sold_kes', title="Sales (KES)"),
-            tooltip=['YearWeek', alt.Tooltip('value_sold_kes', format=',.0f')]
-        )
-        
-        line = base.mark_line(color="red", strokeDash=[5, 5]).encode(
-            y=alt.Y('Target', title="Weekly Target"),
-            tooltip=[alt.Tooltip('Target', format=',.0f')]
-        )
-        
-        st.altair_chart(bar + line, use_container_width=True)
-
-        # --- Detailed List ---
-        st.subheader("📋 Customer Details")
-        
-        cust_mill = mf.groupby(["customer_name", "region_name", "sales_rep_name"]).agg(
-            total_spent=("value_sold_kes", "sum"),
-            brands_bought=("brand_name", lambda x: ", ".join(sorted(x.dropna().unique()))),
-            products=("product_name", "count")
-        ).reset_index().sort_values("total_spent", ascending=False)
-        
-        st.caption("Select a customer to view detailed product breakdown.")
-        
-        event = st.dataframe(
-            cust_mill.style.format({"total_spent": "{:,.0f}"}),
-            use_container_width=True,
-            on_select="rerun",
-            selection_mode="single-row"
-        )
-        
-        if event.selection.rows:
-            idx = event.selection.rows[0]
-            selected_customer = cust_mill.iloc[idx]["customer_name"]
-            
-            with st.expander(f"📦 Product Details: {selected_customer}", expanded=True):
-                cust_details = mf[mf["customer_name"] == selected_customer].copy()
-                
-                # Ensure columns exist
-                cols = ["product_code", "product_sku", "brand_name", "quantity_cases", "value_sold_kes"]
-                for c in cols:
-                    if c not in cust_details.columns:
-                        cust_details[c] = 0.0 # Default to 0.0 instead of "-" for numeric safety
-                        
-                # Safely convert to numeric to handle any accidental strings or Nones
-                cust_details["quantity_cases"] = pd.to_numeric(cust_details["quantity_cases"], errors='coerce').fillna(0)
-                cust_details["value_sold_kes"] = pd.to_numeric(cust_details["value_sold_kes"], errors='coerce').fillna(0)
-                        
-                st.dataframe(
-                    cust_details[cols].rename(columns={
-                        "product_code": "Code", 
-                        "product_sku": "Product", 
-                        "brand_name": "Brand", 
-                        "quantity_cases": "Quantity", 
-                        "value_sold_kes": "Value"
-                    }).style.format({
-                        "Value": "{:,.0f}",
-                        "Quantity": "{:,.2f}"
-                    }),
-                    use_container_width=True
-                )
-
-                # --- NEW: Proposed / Missing Products ---
-                st.markdown("#### 🚀 Opportunity: Proposed Products (Missing)")
-                
-                # 1. Identify what they bought (in current filter context)
-                bought_skus = set(cust_details["product_sku"].dropna().unique())
-                
-                # 2. Identify Universe of Mill Products (from mill_all)
-                # We use mill_all to see what EXISTS in the system globally
-                if not mill_all.empty:
-                    # Include product_code in the universe
-                    all_mill_skus = mill_all[["product_code", "product_sku", "brand_name"]].drop_duplicates("product_sku")
-                    
-                    # 3. Find Missing
-                    missing_products = all_mill_skus[~all_mill_skus["product_sku"].isin(bought_skus)].sort_values("brand_name")
-                    
-                    if not missing_products.empty:
-                        st.caption(f"Products stocked by others but not bought by {selected_customer} in this period.")
-                        st.dataframe(
-                            missing_products.rename(columns={
-                                "product_code": "Code",
-                                "product_sku": "Product",
-                                "brand_name": "Brand"
-                            }),
-                            use_container_width=True,
-                            hide_index=True
-                        )
-                    else:
-                        st.success(f"🌟 {selected_customer} is stocking all known Mill Products!")
-                else:
-                    st.info("No global Mill Products data available to calculate opportunities.")
-
-# =========================================================
-# CUSTOMERS TAB
-# =========================================================
-with tab_customers:
-    st.header("👥 Customer Product Analysis")
-    
-    # --- Tab-Specific Filters ---
-    # We use lines_all (Full History) but apply the Global Date Filter to keep time context relevant
-    # We DO NOT use the Global Region/Rep filters here, allowing independent drill-down
-    
-    # 1. Apply Global Date Filter to create a Base Context
-    # Reuse logic from apply_filters but only for date
-    c_df = lines_all.copy()
-    if not c_df.empty:
-        c_df["report_date_iso"] = pd.to_datetime(c_df["report_date_iso"])
-        
-        d_range = date_sel # From global scope
-        if d_range:
-            if isinstance(d_range, tuple):
-                if len(d_range) == 2:
-                    start, end = pd.to_datetime(d_range[0]), pd.to_datetime(d_range[1])
-                    c_df = c_df[(c_df["report_date_iso"] >= start) & (c_df["report_date_iso"] <= end)]
-                elif len(d_range) == 1:
-                    start = pd.to_datetime(d_range[0])
-                    c_df = c_df[c_df["report_date_iso"] == start]
-            else:
-                start = pd.to_datetime(d_range)
-                c_df = c_df[c_df["report_date_iso"] == start]
-    
-    if c_df.empty:
-        st.warning("No data available for the selected Date Period.")
-    else:
-        # Dynamic Filters Container
-        cf1, cf2, cf3 = st.columns(3)
-        
-        # 1. Region Filter
-        all_cust_regions = ["All"] + sorted(c_df["region_name"].dropna().unique())
-        c_region = cf1.selectbox("Filter Region", all_cust_regions, key="c_region_sel")
-        
-        # Filter Data by Region
-        c_df_reg = c_df if c_region == "All" else c_df[c_df["region_name"] == c_region]
-        
-        # 2. Rep Filter (Dependent on Region)
-        avail_reps = sorted(c_df_reg["sales_rep_name"].dropna().unique())
-        c_rep_list = ["All"] + avail_reps
-        c_rep = cf2.selectbox("Filter Rep", c_rep_list, key="c_rep_sel")
-        
-        # Filter Data by Rep
-        c_df_rep = c_df_reg if c_rep == "All" else c_df_reg[c_df_reg["sales_rep_name"] == c_rep]
-        
-        # 3. Customer Filter (Dependent on Region & Rep)
-        avail_custs = sorted(c_df_rep["customer_name"].dropna().unique())
-        if not avail_custs:
-            cf3.warning("No customers found.")
-            c_customer = None
-        else:
-            # Add "All" option
-            cust_options = ["All"] + avail_custs
-            c_customer = cf3.selectbox("Select Customer", cust_options, key="c_cust_sel")
-            
-        st.markdown("---")
-        
-        if c_customer:
-            if c_customer == "All":
-                st.subheader(f"Summary: All Customers ({len(avail_custs)})")
-                
-                # Show summary table of all customers in the current filtered scope
-                cust_summary = c_df_rep.groupby("customer_name").agg(
-                    total_value=("value_sold_kes", "sum"),
-                    total_cases=("quantity_cases", "sum"),
-                    lines_bought=("product_code", "count"),
-                    distinct_products=("product_sku", "nunique")
-                ).reset_index().sort_values("total_value", ascending=False)
-                
-                st.dataframe(
-                    cust_summary.rename(columns={
-                        "customer_name": "Customer",
-                        "total_value": "Total Value (KES)",
-                        "total_cases": "Total Cases",
-                        "lines_bought": "Lines",
-                        "distinct_products": "Unique Products"
-                    }).style.format({
-                        "Total Value (KES)": "{:,.0f}",
-                        "Total Cases": "{:,.1f}"
-                    }),
-                    use_container_width=True
-                )
-                
-            else:
-                # --- Analysis ---
-                st.subheader(f"Analysis: {c_customer}")
-                
-                # Data for this customer
-                cust_data = c_df_rep[c_df_rep["customer_name"] == c_customer]
-                
-                # 1. Products Bought
-                bought_skus = cust_data.groupby(["product_code", "product_sku", "brand_name"]).agg(
-                    qty=("quantity_cases", "sum"),
-                    val=("value_sold_kes", "sum"),
-                    lines=("product_code", "count") # Frequency
-                ).reset_index()
-                
-                # 2. Products Not Purchased (Gap Analysis)
-                # Universe: All products sold in the filtered scope (Region/Rep context)
-                universe_df = c_df_reg # Use Region context for relevance
-                # universe_skus = universe_df[["product_sku", "product_name", "brand_name"]].drop_duplicates("product_sku") # Old logic
-                
-                # Identify Missing
-                bought_sku_set = set(bought_skus["product_sku"])
-                missing_skus = universe_df[~universe_df["product_sku"].isin(bought_sku_set)]
-                
-                # Summarize Missing (to see popularity)
-                missing_summary = missing_skus.groupby(["product_code", "product_sku", "brand_name"]).agg(
-                    popularity=("customer_id", "nunique"), # How many other customers bought it
-                    total_mkt_val=("value_sold_kes", "sum")
-                ).reset_index().sort_values("popularity", ascending=False)
-                
-                # --- Display ---
-                col_bought, col_missed = st.columns(2)
-                
-                with col_bought:
-                    st.write(f"✅ **Products Bought** ({len(bought_skus)})")
-                    if not bought_skus.empty:
-                        st.dataframe(
-                            bought_skus.sort_values("val", ascending=False)
-                            .rename(columns={
-                                "product_code": "Code",
-                                "product_sku": "Product", 
-                                "brand_name": "Brand",
-                                "val": "Value (KES)", 
-                                "qty": "Cases"
-                            })
-                            [["Code", "Product", "Brand", "Value (KES)", "Cases"]]
-                            .style.format({"Value (KES)": "{:,.0f}", "Cases": "{:,.1f}"}),
-                            use_container_width=True,
-                            height=400
-                        )
-                    else:
-                        st.info("No purchases in this period.")
-                
-                with col_missed:
-                    st.write(f"❌ **Products Not Purchased** (Top Opportunities)")
-                    st.caption(f"Top selling items in **{c_region}** not bought by {c_customer}")
-                    if not missing_summary.empty:
-                        st.dataframe(
-                            missing_summary.head(50) # Show top 50
-                            .rename(columns={
-                                "product_code": "Code",
-                                "product_sku": "Product", 
-                                "brand_name": "Brand",
-                                "popularity": "Custs Buying"
-                            })
-                            [["Code", "Product", "Brand", "Custs Buying"]]
-                            .style.format({"Custs Buying": "{:,.0f}"}),
-                            use_container_width=True,
-                            height=400
-                        )
-                    else:
-                        st.success("🎉 This customer has bought EVERYTHING available in this region!")
-                
-                # --- Purchase History Breakdown ---
-                st.markdown("---")
-                st.subheader("🗓️ Purchase History Breakdown")
-                
-                # 1. Previous Day Purchases (Relative to dataset max date or today)
-                # Find the last date this customer bought something
-                if not cust_data.empty:
-                    last_purchase_date = cust_data["report_date_iso"].max()
-                    prev_day_data = cust_data[cust_data["report_date_iso"] == last_purchase_date]
-                    
-                    st.markdown(f"**Last Purchase Date:** {last_purchase_date.strftime('%Y-%m-%d')}")
-                    
-                    st.dataframe(
-                        prev_day_data[["product_code", "product_sku", "brand_name", "quantity_cases", "value_sold_kes"]]
-                        .rename(columns={
-                            "product_code": "Code",
-                            "product_sku": "Product",
-                            "brand_name": "Brand",
-                            "quantity_cases": "Cases",
-                            "value_sold_kes": "Value"
-                        })
-                        .style.format({"Value": "{:,.0f}", "Cases": "{:,.1f}"}),
-                        use_container_width=True
-                    )
-                
-                # 2. Time-based Breakdown (Day, Week, Month)
-                st.markdown("#### 📅 Items Ordered by Period")
-                t_day, t_week, t_month = st.tabs(["Daily", "Weekly", "Monthly"])
-                
-                with t_day:
-                    daily_breakdown = cust_data.groupby(["report_date_iso", "product_sku", "brand_name"]).agg(
-                        qty=("quantity_cases", "sum"),
-                        val=("value_sold_kes", "sum")
-                    ).reset_index().sort_values("report_date_iso", ascending=False)
-                    
-                    st.dataframe(
-                        daily_breakdown.rename(columns={
-                            "report_date_iso": "Date",
-                            "product_sku": "Product",
-                            "brand_name": "Brand",
-                            "qty": "Cases",
-                            "val": "Value"
-                        }).style.format({"Value": "{:,.0f}", "Cases": "{:,.1f}", "Date": "{:%Y-%m-%d}"}),
-                        use_container_width=True
-                    )
-
-                with t_week:
-                    # Calculate Week
-                    cust_data_w = cust_data.copy()
-                    cust_data_w["YearWeek"] = cust_data_w["report_date_iso"].dt.year.astype(str) + "-W" + cust_data_w["report_date_iso"].dt.isocalendar().week.astype(str)
-                    
-                    weekly_breakdown = cust_data_w.groupby(["YearWeek", "product_sku", "brand_name"]).agg(
-                        qty=("quantity_cases", "sum"),
-                        val=("value_sold_kes", "sum")
-                    ).reset_index().sort_values("YearWeek", ascending=False)
-                    
-                    st.dataframe(
-                        weekly_breakdown.rename(columns={
-                            "YearWeek": "Week",
-                            "product_sku": "Product",
-                            "brand_name": "Brand",
-                            "qty": "Cases",
-                            "val": "Value"
-                        }).style.format({"Value": "{:,.0f}", "Cases": "{:,.1f}"}),
-                        use_container_width=True
-                    )
-
-                with t_month:
-                    # Calculate Month
-                    cust_data_m = cust_data.copy()
-                    cust_data_m["Month"] = cust_data_m["report_date_iso"].dt.strftime("%Y-%m")
-                    
-                    monthly_breakdown = cust_data_m.groupby(["Month", "product_sku", "brand_name"]).agg(
-                        qty=("quantity_cases", "sum"),
-                        val=("value_sold_kes", "sum")
-                    ).reset_index().sort_values("Month", ascending=False)
-                    
-                    st.dataframe(
-                        monthly_breakdown.rename(columns={
-                            "product_sku": "Product",
-                            "brand_name": "Brand",
-                            "qty": "Cases",
-                            "val": "Value"
-                        }).style.format({"Value": "{:,.0f}", "Cases": "{:,.1f}"}),
-                        use_container_width=True
-                    )
-
 # =========================================================
 # INSIGHTS TAB
 # =========================================================
@@ -1694,77 +1015,6 @@ with tab_insights:
         st.info(f"💡 **Action:** You have **{total_unproductive}** customers on the PJP who didn't buy. Prioritize revisiting them.")
 
         st.markdown("---")
-        st.subheader("🔍 Visit Effectiveness Analysis")
-        st.caption("Comparison of Actual Visits vs. Buying Customers (Zero Sales Visits)")
-
-        # Prepare Data
-        # Activity Data (Visits)
-        vis_data = af.groupby(["region_name", "sales_rep_name", "sales_rep_id"]).agg(
-            total_visits=("actual_visits", "sum")
-        ).reset_index()
-
-        # Sales Data (Buying Customers)
-        buy_data = of.groupby("sales_rep_id").agg(
-            buying_customers=("customer_id", "nunique")
-        ).reset_index()
-
-        # Merge
-        eff_df = pd.merge(vis_data, buy_data, on="sales_rep_id", how="left").fillna(0)
-        
-        # Calculate Non-Buying
-        # Assumption: 1 Visit per Buying Customer. 
-        # Non-Buying = Total Visits - Buying Customers
-        eff_df["non_buying_visits"] = eff_df["total_visits"] - eff_df["buying_customers"]
-        # Handle negative values (if data inconsistency)
-        eff_df["non_buying_visits"] = eff_df["non_buying_visits"].apply(lambda x: max(x, 0))
-        
-        # Calculate Strike Rate
-        eff_df["strike_rate"] = (eff_df["buying_customers"] / eff_df["total_visits"] * 100).fillna(0)
-        # Cap at 100% for display if data is weird
-        eff_df["strike_rate"] = eff_df["strike_rate"].apply(lambda x: min(x, 100.0))
-
-        # 1. Regional Summary Chart
-        st.write("**Regional Breakdown**")
-        reg_eff = eff_df.groupby("region_name")[["total_visits", "buying_customers", "non_buying_visits"]].sum().reset_index()
-        
-        # Melt for Stacked Bar
-        reg_melt = reg_eff.melt("region_name", value_vars=["buying_customers", "non_buying_visits"], var_name="Type", value_name="Count")
-        reg_melt["Type"] = reg_melt["Type"].map({"buying_customers": "Buying (Productive)", "non_buying_visits": "Non-Buying (Zero Sales)"})
-        
-        c_eff = alt.Chart(reg_melt).mark_bar().encode(
-            x=alt.X('region_name', title="Region"),
-            y=alt.Y('Count', title="Visits"),
-            color=alt.Color('Type', scale=alt.Scale(domain=['Buying (Productive)', 'Non-Buying (Zero Sales)'], range=['#4caf50', '#ef5350'])),
-            tooltip=['region_name', 'Type', 'Count']
-        ).properties(height=300)
-        
-        st.altair_chart(c_eff, use_container_width=True)
-
-        # 2. Rep Detailed Table
-        st.write("**Rep Performance Details**")
-        
-        # Format for display
-        disp_eff = eff_df[["region_name", "sales_rep_name", "total_visits", "buying_customers", "non_buying_visits", "strike_rate"]].sort_values("non_buying_visits", ascending=False)
-        
-        st.dataframe(
-            disp_eff.rename(columns={
-                "region_name": "Region",
-                "sales_rep_name": "Rep",
-                "total_visits": "Total Visits",
-                "buying_customers": "Buying Cust.",
-                "non_buying_visits": "Non-Buying (Zero Sales)",
-                "strike_rate": "Strike Rate %"
-            }).style.format({
-                "Total Visits": "{:,.0f}",
-                "Buying Cust.": "{:,.0f}",
-                "Non-Buying (Zero Sales)": "{:,.0f}",
-                "Strike Rate %": "{:.1f}%"
-            }),
-            use_container_width=True
-        )
-
-        st.markdown("---")
-
         st.subheader("👮 Sales Rep Specific Coaching")
 
         # Generate insights per rep
@@ -1938,10 +1188,8 @@ if tab_upload:
                     if not value_col:
                         st.error("Could not detect a 'Value Sold' column in File 2.")
                         st.stop()
-                        
-                    qty_col = detect_quantity_column(df2)
 
-                    rename_map = {
+                    df2 = df2.rename(columns={
                         "ENTRY_ID": "entry_id",
                         "SALES_REP_ID": "sales_rep_id",
                         "SALES_REP": "sales_rep_name",
@@ -1955,38 +1203,7 @@ if tab_upload:
                         "PRODUCT_SKU": "product_sku",
                         "BRAND_NAME": "brand_name",
                         value_col: "value_sold_kes",
-                    }
-                    
-                    if qty_col:
-                        rename_map[qty_col] = "quantity_cases"
-                    
-                    df2 = df2.rename(columns=rename_map)
-                    
-                    # --- Safety Check: Ensure all required columns exist ---
-                    required_cols = [
-                        "entry_id", "sales_rep_id", "sales_rep_name", "customer_id", 
-                        "customer_code", "customer_name", "region_name", "product_code", 
-                        "product_id", "product_name", "product_sku", "brand_name", 
-                        "value_sold_kes"
-                    ]
-                    
-                    for col in required_cols:
-                        if col not in df2.columns:
-                            # Special handling for product_name fallback
-                            if col == "product_name" and "product_sku" in df2.columns:
-                                df2[col] = df2["product_sku"]
-                            # Special handling for product_sku fallback
-                            elif col == "product_sku" and "product_name" in df2.columns:
-                                df2[col] = df2["product_name"]
-                            else:
-                                # Default empty/zero values
-                                if "id" in col or "code" in col or "name" in col or "sku" in col:
-                                    df2[col] = "-"
-                                else:
-                                    df2[col] = 0.0
-                    
-                    if "quantity_cases" not in df2.columns:
-                        df2["quantity_cases"] = 0.0
+                    })
 
                     # Execute Insertions
                     insert_file1(df1, report_date_1)
