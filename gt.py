@@ -1586,32 +1586,43 @@ with tab_customers:
         st.warning("No data available for the selected Date Period.")
     else:
         # Dynamic Filters Container
-        cf1, cf2, cf3 = st.columns(3)
+        cf_cat, cf_reg, cf_rep, cf_cust = st.columns(4)
         
-        # 1. Region Filter
-        all_cust_regions = ["All"] + sorted(c_df["region_name"].dropna().unique())
-        c_region = cf1.selectbox("Filter Region", all_cust_regions, key="c_region_sel")
+        # 1. Customer Category/Channel Filter (New)
+        avail_cats = ["All"]
+        if "customer_category" in c_df.columns:
+            cats = sorted(c_df["customer_category"].dropna().astype(str).unique())
+            avail_cats += [c for c in cats if c not in ["nan", "-"]]
+        
+        c_category = cf_cat.selectbox("Filter Channel", avail_cats, key="c_cat_sel")
+        
+        # Filter Data by Category
+        c_df_cat = c_df if c_category == "All" else c_df[c_df["customer_category"] == c_category]
+
+        # 2. Region Filter (Dependent on Category)
+        all_cust_regions = ["All"] + sorted(c_df_cat["region_name"].dropna().unique())
+        c_region = cf_reg.selectbox("Filter Region", all_cust_regions, key="c_region_sel")
         
         # Filter Data by Region
-        c_df_reg = c_df if c_region == "All" else c_df[c_df["region_name"] == c_region]
+        c_df_reg = c_df_cat if c_region == "All" else c_df_cat[c_df_cat["region_name"] == c_region]
         
-        # 2. Rep Filter (Dependent on Region)
+        # 3. Rep Filter (Dependent on Region)
         avail_reps = sorted(c_df_reg["sales_rep_name"].dropna().unique())
         c_rep_list = ["All"] + avail_reps
-        c_rep = cf2.selectbox("Filter Rep", c_rep_list, key="c_rep_sel")
+        c_rep = cf_rep.selectbox("Filter Rep", c_rep_list, key="c_rep_sel")
         
         # Filter Data by Rep
         c_df_rep = c_df_reg if c_rep == "All" else c_df_reg[c_df_reg["sales_rep_name"] == c_rep]
         
-        # 3. Customer Filter (Dependent on Region & Rep)
+        # 4. Customer Filter (Dependent on Rep)
         avail_custs = sorted(c_df_rep["customer_name"].dropna().unique())
         if not avail_custs:
-            cf3.warning("No customers found.")
+            cf_cust.warning("No customers found.")
             c_customer = None
         else:
             # Add "All" option
             cust_options = ["All"] + avail_custs
-            c_customer = cf3.selectbox("Select Customer", cust_options, key="c_cust_sel")
+            c_customer = cf_cust.selectbox("Select Customer", cust_options, key="c_cust_sel")
             
         st.markdown("---")
         
