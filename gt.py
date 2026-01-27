@@ -6,11 +6,13 @@ import numpy as np
 import altair as alt
 import hashlib
 import time
+import os
 
 # =========================================================
 # CONFIG
 # =========================================================
 DB_PATH = "gt_sfa.db"
+RAW_DATA_DIR = "raw_uploads"
 LPPC_TARGET = 4.0
 ABV_TARGET = 2000.0
 PRODUCTIVITY_TARGET = 50.0
@@ -69,6 +71,26 @@ def detect_quantity_column(df):
             return col
     return None
 
+def detect_customer_category_column(df):
+    # Priorities: CUSTOMER_CATEGORY, CHANNEL, CUST_CAT, SEGMENT
+    for col in df.columns:
+        u = col.upper()
+        if "CUSTOMER" in u and "CATEGORY" in u: return col
+        if "CUST" in u and "CAT" in u: return col
+        if "CHANNEL" in u: return col
+        if "SEGMENT" in u: return col
+    return None
+
+def detect_product_category_column(df):
+    # Priorities: PRODUCT_CATEGORY, PROD_CAT, CATEGORY
+    for col in df.columns:
+        u = col.upper()
+        if "PRODUCT" in u and "CATEGORY" in u: return col
+        if "PROD" in u and "CAT" in u: return col
+        # Strict "CATEGORY" check to avoid false positives if possible, but common in simple files
+        if u == "CATEGORY": return col
+    return None
+
 def add_column_if_not_exists(conn, table, column, col_type):
     try:
         cur = conn.cursor()
@@ -95,6 +117,26 @@ def get_date_range(period):
         return start, today
     return None, None
 
+def save_raw_file(uploaded_file, prefix, date_iso):
+    """Saves uploaded file to RAW_DATA_DIR with standard naming"""
+    try:
+        # Reset pointer just in case
+        uploaded_file.seek(0)
+        
+        # Get extension
+        ext = uploaded_file.name.split('.')[-1] if '.' in uploaded_file.name else "xlsx"
+        
+        filename = f"{prefix}_{date_iso}.{ext}"
+        path = os.path.join(RAW_DATA_DIR, filename)
+        
+        with open(path, "wb") as f:
+            f.write(uploaded_file.getvalue())
+            
+        return path
+    except Exception as e:
+        st.error(f"Failed to save raw file {prefix}: {e}")
+        return None
+
 # =========================================================
 # DATABASE
 # =========================================================
@@ -104,6 +146,9 @@ def get_connection():
 def init_db():
     conn = get_connection()
     cur = conn.cursor()
+
+    # Ensure Raw Data Directory Exists
+    os.makedirs(RAW_DATA_DIR, exist_ok=True)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS rep_daily_activity (
@@ -295,6 +340,8 @@ def insert_file2(df, report_date):
             "brand_name",
             "value_sold_kes",
             "entry_time_raw",
+            "customer_category",
+            "product_category",
         ]
     ]
 
@@ -883,21 +930,103 @@ with tab_dashboard:
 with tab_lppc:
     st.header("📉 LPPC Analysis & Repair")
     
+    # --- Segmentation Filters ---
+    st.markdown("### 🔍 Segmentation")
+    fil_1, fil_2, fil_3 = st.columns(3)
+    
+    # 1. Brand Category
+    brand_cat_sel = fil_1.selectbox("Brand Category", ["All", "Kimfay Brands", "Partner Brands"])
+    
+    # 2. Customer Channel
+    avail_channels = ["All"]
+    if "customer_category" in lines_all.columns:
+        chans = sorted(lines_all["customer_category"].dropna().astype(str).unique())
+        avail_channels += [c for c in chans if c not in ["nan", "-"]]
+    cust_channel_sel = fil_2.selectbox("Customer Channel", avail_channels)
+    
+    # 3. Product Category
+    avail_cats = ["All"]
+    if "product_category" in lines_all.columns:
+        cats = sorted(lines_all["product_category"].dropna().astype(str).unique())
+        avail_cats += [c for c in cats if c not in ["nan", "-"]]
+    prod_cat_sel = fil_3.selectbox("Product Category", avail_cats)
+
+    st.markdown("---")
+
+    # --- Apply Filters ---
+    lppc_lf = lf.copy()
+    lppc_of = of.copy()
+
+    # Enrich Orders with Customer Category if available
+    if "customer_category" in lines_all.columns:
+         cust_map = lines_all[["customer_id", "customer_category"]].drop_duplicates()
+         # De-dup: take first non-null
+         cust_map = cust_map[cust_map["customer_category"] != "-"]
+         cust_map = cust_map.groupby("customer_id").first().reset_index()
+         lppc_of = lppc_of.merge(cust_map, on="customer_id", how="left")
+         lppc_of["customer_category"] = lppc_of["customer_category"].fillna("-")
+    else:
+         lppc_of["customer_category"] = "-"
+
+    # Filter Logic
+    
+    # 1. Brand Category
+    if brand_cat_sel != "All":
+        def is_kimfay(b):
+            return str(b).upper() in KIMFAY_BRANDS
+        
+        if brand_cat_sel == "Kimfay Brands":
+             lppc_lf = lppc_lf[lppc_lf["brand_name"].apply(is_kimfay)]
+        else: # Partner
+             lppc_lf = lppc_lf[~lppc_lf["brand_name"].apply(is_kimfay)]
+        
+        # Filter orders to those containing the filtered brands
+        keys = lppc_lf[["report_date_iso", "sales_rep_id", "customer_id"]].drop_duplicates()
+        lppc_of = lppc_of.merge(keys, on=["report_date_iso", "sales_rep_id", "customer_id"], how="inner")
+
+    # 2. Customer Channel
+    if cust_channel_sel != "All":
+        lppc_lf = lppc_lf[lppc_lf["customer_category"] == cust_channel_sel]
+        lppc_of = lppc_of[lppc_of["customer_category"] == cust_channel_sel]
+
+    # 3. Product Category
+    if prod_cat_sel != "All":
+        lppc_lf = lppc_lf[lppc_lf["product_category"] == prod_cat_sel]
+        # Filter orders to those containing this product category
+        keys = lppc_lf[["report_date_iso", "sales_rep_id", "customer_id"]].drop_duplicates()
+        lppc_of = lppc_of.merge(keys, on=["report_date_iso", "sales_rep_id", "customer_id"], how="inner")
+
+    # Recalculate Metrics
+    if not lppc_of.empty:
+        # Recalculate lines per order based on filtered lines
+        lines_per_order = lppc_lf.groupby(["report_date_iso", "sales_rep_id", "customer_id"])["product_code"].nunique().reset_index()
+        lines_per_order.columns = ["report_date_iso", "sales_rep_id", "customer_id", "filtered_lines"]
+        
+        lppc_of = lppc_of.merge(lines_per_order, on=["report_date_iso", "sales_rep_id", "customer_id"], how="left")
+        lppc_of["filtered_lines"] = lppc_of["filtered_lines"].fillna(0)
+        
+        total_lines_seg = lppc_of["filtered_lines"].sum()
+        total_orders_seg = len(lppc_of)
+        lppc_seg = total_lines_seg / total_orders_seg if total_orders_seg > 0 else 0
+    else:
+        lppc_seg = 0
+        total_orders_seg = 0
+        total_lines_seg = 0
+
     col_lppc_1, col_lppc_2 = st.columns([2, 1])
     
     with col_lppc_1:
         st.subheader("📦 SKU Analysis (Top 10 by Volume)")
-        st.caption("Identify high-volume SKUs and their penetration to find LPPC drivers.")
+        st.caption(f"Segment: {brand_cat_sel} | {cust_channel_sel} | {prod_cat_sel}")
         
-        if not lf.empty:
-            sku_stats = lf.groupby(["product_sku", "brand_name"], as_index=False).agg(
+        if not lppc_lf.empty:
+            sku_stats = lppc_lf.groupby(["product_sku", "brand_name"], as_index=False).agg(
                 lines_sold=("product_code", "count"),
                 customers_reached=("customer_id", "nunique"),
                 total_value=("value_sold_kes", "sum")
             )
             
-            total_orders_period = of["customer_id"].nunique()
-            sku_stats["penetration"] = (sku_stats["customers_reached"] / total_orders_period * 100)
+            sku_stats["penetration"] = (sku_stats["customers_reached"] / total_orders_seg * 100) if total_orders_seg > 0 else 0
             sku_stats["lines_per_cust"] = sku_stats["lines_sold"] / sku_stats["customers_reached"]
             
             # Sort by lines_sold to show biggest impact items
@@ -922,8 +1051,11 @@ with tab_lppc:
             # --- NEW: Lines per Order Distribution ---
             st.subheader("📊 Lines per Order Distribution")
             st.caption("How many customers are buying only 1 or 2 lines? These are your easiest growth targets.")
-            if not of.empty:
-                dist_data = of["lines_count"].value_counts().sort_index()
+            
+            if not lppc_of.empty:
+                dist_data = lppc_of["filtered_lines"].value_counts().sort_index()
+                # Filter out 0 lines
+                dist_data = dist_data[dist_data.index > 0]
                 
                 # Altair Chart with Axis Labels
                 chart_df = dist_data.reset_index()
@@ -944,12 +1076,12 @@ with tab_lppc:
 
                 # --- NEW: Actionable Targets ---
                 st.subheader("🎯 Target Customers (1-Line Orders)")
-                st.caption("Top value customers who only bought 1 line. Easy upsell targets.")
+                st.caption("Top value customers who only bought 1 line in this segment.")
                 
                 # Merge with customer name from lf
                 targets = (
-                    of[of["lines_count"] == 1]
-                    .merge(lf[["customer_id", "customer_name"]].drop_duplicates("customer_id"), on="customer_id", how="left")
+                    lppc_of[lppc_of["filtered_lines"] == 1]
+                    .merge(lppc_lf[["customer_id", "customer_name"]].drop_duplicates("customer_id"), on="customer_id", how="left")
                     .fillna({"customer_name": "Unknown"})
                 )
 
@@ -957,9 +1089,9 @@ with tab_lppc:
                 targets = targets.merge(af[["sales_rep_id", "sales_rep_name", "region_name"]].drop_duplicates("sales_rep_id"), on="sales_rep_id", how="left")
                 
                 # Merge with Product Details for 1-Line Orders
-                if not lf.empty:
+                if not lppc_lf.empty:
                     # distinct lines only to avoid duplication if multiple entries exist for same SKU/Order
-                    prod_details = lf[["report_date_iso", "sales_rep_id", "customer_id", "brand_name", "product_sku", "product_code"]].drop_duplicates()
+                    prod_details = lppc_lf[["report_date_iso", "sales_rep_id", "customer_id", "brand_name", "product_sku", "product_code"]].drop_duplicates()
                     targets = targets.merge(
                         prod_details, 
                         on=["report_date_iso", "sales_rep_id", "customer_id"], 
@@ -991,14 +1123,14 @@ with tab_lppc:
                         use_container_width=True
                     )
                 else:
-                    st.success("No single-line orders found! Great cross-selling.")
+                    st.success("No single-line orders found in this segment!")
 
             st.subheader("Region LPPC Heatmap")
-            if not of.empty:
+            if not lppc_of.empty:
                 heatmap_data = (
-                    of.merge(af[["sales_rep_id", "region_name"]], on="sales_rep_id", how="left")
+                    lppc_of.merge(af[["sales_rep_id", "region_name"]], on="sales_rep_id", how="left")
                     .groupby(["region_name", "report_date_iso"])
-                    .agg(lines=("lines_count", "sum"), orders=("customer_id", "nunique"))
+                    .agg(lines=("filtered_lines", "sum"), orders=("customer_id", "nunique"))
                     .reset_index()
                 )
                 heatmap_data["LPPC"] = heatmap_data["lines"] / heatmap_data["orders"]
@@ -1009,9 +1141,9 @@ with tab_lppc:
                 def color_lppc_heatmap(val):
                     if pd.isna(val):
                         return ""
-                    if val < 3.0:
+                    if val < 4.0:
                         return "background-color: #ffcdd2; color: black"
-                    elif val < 4.0:
+                    elif val < 4.5:
                         return "background-color: #fff9c4; color: black"
                     else:
                         return "background-color: #c8e6c9; color: black"
@@ -1032,21 +1164,26 @@ with tab_lppc:
         uplift = st.slider("Simulate adding lines per call:", 1, 3, 1)
         
         # Calculate current metrics for simulation
-        total_lines = of["lines_count"].sum()
-        total_sales = of["order_value_kes"].sum()
-        orders_collected = of["customer_id"].nunique()
-        lppc_actual = total_lines / orders_collected if orders_collected > 0 else 0
+        current_lines = lppc_of["filtered_lines"].sum() if not lppc_of.empty else 0
+        current_revenue = lppc_lf["value_sold_kes"].sum() if not lppc_lf.empty else 0
+        total_orders_seg = len(lppc_of)
         
-        current_lines = total_lines
-        current_revenue = total_sales
         avg_price_per_line = current_revenue / current_lines if current_lines > 0 else 0
         
-        simulated_lines = current_lines + (orders_collected * uplift)
+        simulated_lines = current_lines + (total_orders_seg * uplift)
         simulated_revenue = simulated_lines * avg_price_per_line
-        simulated_lppc = simulated_lines / orders_collected if orders_collected > 0 else 0
+        simulated_lppc = simulated_lines / total_orders_seg if total_orders_seg > 0 else 0
         
-        st.metric("Current LPPC", f"{lppc_actual:.2f}")
-        st.metric(f"Simulated LPPC (+{uplift})", f"{simulated_lppc:.2f}", delta=f"{simulated_lppc - lppc_actual:.2f}")
+        st.metric("Current LPPC", f"{lppc_seg:.2f}", delta=f"{lppc_seg - 4.0:.2f} vs Target 4.0")
+        
+        # Gap to Target
+        gap = 4.0 - lppc_seg
+        if gap > 0:
+             st.info(f"📉 You are **{gap:.2f}** points away from the LPPC Target of 4.0.")
+        else:
+             st.success(f"🎉 You have hit the LPPC Target of 4.0!")
+
+        st.metric(f"Simulated LPPC (+{uplift})", f"{simulated_lppc:.2f}", delta=f"{simulated_lppc - lppc_seg:.2f}")
         st.metric("Simulated Revenue Impact", f"KES {simulated_revenue:,.0f}", delta=f"{simulated_revenue - current_revenue:,.0f}")
         
         st.markdown("---")
@@ -1055,13 +1192,9 @@ with tab_lppc:
         st.subheader("🚫 Missed Opportunities")
         st.caption("Top selling SKUs (Market-wide) NOT sold in the current selection.")
         
-        # 1. Get Global Top SKUs (from full dataset 'lines_all' if possible, or 'lf' if filter is large)
-        # Using 'lf' (filtered) as base might be too narrow if filtered to 1 rep. 
-        # Better to compare 'lf' (current selection) vs 'lines_all' (global benchmark).
-        
         if not lines_all.empty:
             global_top = lines_all["product_sku"].value_counts().head(20).index.tolist()
-            current_sold = lf["product_sku"].unique()
+            current_sold = lppc_lf["product_sku"].unique() if not lppc_lf.empty else []
             
             missing_opportunities = [sku for sku in global_top if sku not in current_sold]
             
@@ -1074,24 +1207,22 @@ with tab_lppc:
 
         st.markdown("### What to push tomorrow")
         st.info("Based on top selling SKUs not in bottom 20% of distribution:")
-        if not lf.empty:
-            top_skus = lf["product_sku"].value_counts().head(5).index.tolist()
+        if not lppc_lf.empty:
+            top_skus = lppc_lf["product_sku"].value_counts().head(5).index.tolist()
             for sku in top_skus:
                 st.write(f"• {sku}")
                 
         if st.button("Export Repair Plan to Excel"):
-             # Mock export functionality - creating a simple CSV download
-             # Since we can't save files to client machine directly without download button flow
-             # We create a dataframe and convert to CSV
-             plan_df = sku_stats.sort_values("customers_reached", ascending=True)
-             csv = plan_df.to_csv(index=False).encode('utf-8')
-             st.download_button(
-                 "Download Plan.csv",
-                 csv,
-                 "lppc_repair_plan.csv",
-                 "text/csv",
-                 key='download-csv'
-             )
+             if not sku_stats.empty:
+                 plan_df = sku_stats.sort_values("customers_reached", ascending=True)
+                 csv = plan_df.to_csv(index=False).encode('utf-8')
+                 st.download_button(
+                     "Download Plan.csv",
+                     csv,
+                     "lppc_repair_plan.csv",
+                     "text/csv",
+                     key='download-csv'
+                 )
 
 
 
@@ -1922,6 +2053,11 @@ if tab_upload:
             
             if st.button("✅ Confirm & Process Upload"):
                 with st.spinner("Processing..."):
+                    
+                    # --- Save Raw Files ---
+                    save_raw_file(file1, "rep_daily_activity", iso_date)
+                    save_raw_file(file2, "sales_line_entries", iso_date)
+                    
                     # Rename columns to match DB schema
                     df1 = df1.rename(columns={
                         "ID": "sales_rep_id",
@@ -1940,6 +2076,8 @@ if tab_upload:
                         st.stop()
                         
                     qty_col = detect_quantity_column(df2)
+                    cust_cat_col = detect_customer_category_column(df2)
+                    prod_cat_col = detect_product_category_column(df2)
 
                     rename_map = {
                         "ENTRY_ID": "entry_id",
@@ -1954,11 +2092,19 @@ if tab_upload:
                         "PRODUCT_NAME": "product_name",
                         "PRODUCT_SKU": "product_sku",
                         "BRAND_NAME": "brand_name",
+                        # "CUSTOMER_CATEGORY": "customer_category", # Handled dynamically below
+                        # "PRODUCT_CATEGORY": "product_category", # Handled dynamically below
                         value_col: "value_sold_kes",
                     }
                     
                     if qty_col:
                         rename_map[qty_col] = "quantity_cases"
+                    
+                    if cust_cat_col:
+                        rename_map[cust_cat_col] = "customer_category"
+                        
+                    if prod_cat_col:
+                        rename_map[prod_cat_col] = "product_category"
                     
                     df2 = df2.rename(columns=rename_map)
                     
@@ -1967,7 +2113,7 @@ if tab_upload:
                         "entry_id", "sales_rep_id", "sales_rep_name", "customer_id", 
                         "customer_code", "customer_name", "region_name", "product_code", 
                         "product_id", "product_name", "product_sku", "brand_name", 
-                        "value_sold_kes"
+                        "value_sold_kes", "customer_category", "product_category"
                     ]
                     
                     for col in required_cols:
@@ -1980,7 +2126,7 @@ if tab_upload:
                                 df2[col] = df2["product_name"]
                             else:
                                 # Default empty/zero values
-                                if "id" in col or "code" in col or "name" in col or "sku" in col:
+                                if "id" in col or "code" in col or "name" in col or "sku" in col or "category" in col:
                                     df2[col] = "-"
                                 else:
                                     df2[col] = 0.0
