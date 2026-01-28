@@ -22,16 +22,6 @@ KIMFAY_BRANDS = [
     "SIFA", "TISSUE POA", "TISHU POA", "FAY", "COSY POA", 
     "FAY WET TISSUE (BIG PACK)", "FAY WET WIPES", "COSY"
 ]
-PARENT_REGIONS = ["Nairobi", "Mountain", "Rift", "Lake", "Coast"]
-
-def to_parent_region(name: str):
-    u = str(name).upper()
-    if "NAIROBI" in u: return "Nairobi"
-    if "MOUNTAIN" in u: return "Mountain"
-    if "RIFT" in u: return "Rift"
-    if "NYANZA" in u or "LAKE" in u: return "Lake"
-    if "COAST" in u or "MOMBASA" in u or "KILIFI" in u: return "Coast"
-    return None
 
 # =========================================================
 # HELPERS
@@ -239,27 +229,6 @@ def init_db():
         order_value_kes REAL,
         lines_count INTEGER,
         PRIMARY KEY (report_date_iso, sales_rep_id, customer_id)
-    );
-    """)
-
-    # GT Targets (Brand × Category × Parent Region)
-    # Migration: Check if table exists with old schema. If so, drop and recreate (since this is dev/early stage).
-    # Checking for product_category column presence.
-    try:
-        cur.execute("SELECT product_category FROM gt_brand_targets LIMIT 1")
-    except sqlite3.OperationalError:
-        # Column missing or table missing. If table exists but col missing, drop it to recreate with new PK.
-        cur.execute("DROP TABLE IF EXISTS gt_brand_targets")
-    
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS gt_brand_targets (
-        brand_name TEXT,
-        product_category TEXT,
-        parent_region TEXT,
-        target_volume REAL,
-        target_revenue REAL,
-        upload_ts TEXT,
-        PRIMARY KEY (brand_name, product_category, parent_region)
     );
     """)
 
@@ -618,9 +587,6 @@ def calculate_metrics(af_curr, of_curr):
 # TABS
 # =========================================================
 tabs_list = ["📊 Dashboard", "📉 LPPC", "🏭 Mill Products", "👥 Customers", "🧠 Insights"]
-# Insert GT Performance tab
-tabs_list.append("🏬 GT Performance")
-
 if st.session_state.get('role') == 'super_admin':
     tabs_list.append("📥 Upload")
 
@@ -631,205 +597,7 @@ tab_lppc = all_tabs[1]
 tab_mill = all_tabs[2]
 tab_customers = all_tabs[3]
 tab_insights = all_tabs[4]
-tab_gt = all_tabs[5]
-tab_upload = all_tabs[6] if len(all_tabs) > 6 else None
-
-# =========================================================
-# GT PERFORMANCE TAB
-# =========================================================
-with tab_gt:
-    st.subheader("GT Performance")
-
-    # Combine sales sources
-    sales_cols = ["report_date_iso", "region_name", "brand_name", "customer_id", "quantity_cases", "value_sold_kes", "product_category", "product_code", "product_name"]
-    df_lines = lines_all[sales_cols].copy() if not lines_all.empty else pd.DataFrame(columns=sales_cols)
-    df_mill = mill_all[sales_cols].copy() if not mill_all.empty else pd.DataFrame(columns=sales_cols)
-    sales_df = pd.concat([df_lines, df_mill], ignore_index=True)
-    if "quantity_cases" not in sales_df.columns: sales_df["quantity_cases"] = 0.0
-    sales_df["parent_region"] = sales_df["region_name"].apply(to_parent_region)
-    sales_df = sales_df[sales_df["parent_region"].isin(PARENT_REGIONS)].copy()
-    
-    # Create Product Label for filtering
-    sales_df["product_label"] = sales_df["product_code"].fillna("").astype(str) + " - " + sales_df["product_name"].fillna("").astype(str)
-
-    # Filters
-    fil1, fil2, fil3 = st.columns(3)
-    with fil1:
-        date_sel = st.date_input("Date Range", (datetime.today().date().replace(day=1), datetime.today().date()))
-    with fil2:
-        brands = sorted(sales_df["brand_name"].dropna().unique())
-        sel_brands = st.multiselect("Brand", ["All"] + brands, default=["All"]) 
-    with fil3:
-        sel_regions = st.multiselect("Parent Region", PARENT_REGIONS, default=PARENT_REGIONS)
-        
-    fil4, fil5 = st.columns(2)
-    with fil4:
-        cats = sorted(sales_df["product_category"].dropna().astype(str).unique())
-        sel_cats = st.multiselect("Product Category", ["All"] + cats, default=["All"])
-    with fil5:
-        prods = sorted(sales_df["product_label"].dropna().unique())
-        sel_prods = st.multiselect("Product (Code - Name)", ["All"] + prods, default=["All"])
-
-    # Apply filters
-    if isinstance(date_sel, tuple) and len(date_sel) == 2:
-        start, end = pd.to_datetime(date_sel[0]), pd.to_datetime(date_sel[1])
-        sales_df = sales_df[(sales_df["report_date_iso"] >= start) & (sales_df["report_date_iso"] <= end)]
-    if sel_brands and "All" not in sel_brands:
-        sales_df = sales_df[sales_df["brand_name"].isin(sel_brands)]
-    sales_df = sales_df[sales_df["parent_region"].isin(sel_regions)]
-    if sel_cats and "All" not in sel_cats:
-        sales_df = sales_df[sales_df["product_category"].astype(str).isin(sel_cats)]
-    if sel_prods and "All" not in sel_prods:
-        sales_df = sales_df[sales_df["product_label"].isin(sel_prods)]
-
-    # Load targets
-    conn = get_connection()
-    tgt_df = pd.read_sql("SELECT brand_name, product_category, parent_region, target_volume, target_revenue FROM gt_brand_targets", conn)
-    conn.close()
-
-    # Upload Targets
-    with st.expander("Upload Brand × Category × Region Targets", expanded=False):
-        st.markdown("**Download Template**")
-        # Generate template with all combinations
-        if not sales_df.empty:
-            # Extract unique Brand-Category pairs from actual sales
-            existing_pairs = sales_df[["brand_name", "product_category"]].dropna().drop_duplicates()
-        else:
-            # Fallback if no sales data
-            existing_pairs = pd.DataFrame([(b, "General") for b in KIMFAY_BRANDS], columns=["brand_name", "product_category"])
-
-        t_rows = []
-        for _, row in existing_pairs.iterrows():
-            b, c = row["brand_name"], row["product_category"]
-            for r in PARENT_REGIONS:
-                t_rows.append({"Brand": b, "Category": c, "Region": r, "Target Volume": "", "Target Revenue": ""})
-        
-        t_df = pd.DataFrame(t_rows).sort_values(["Brand", "Category", "Region"])
-        csv_templ = t_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="Download CSV Template",
-            data=csv_templ,
-            file_name="gt_targets_template_v2.csv",
-            mime="text/csv"
-        )
-        
-        up = st.file_uploader("Excel/CSV with columns: Brand, Category, Region, Target Volume, Target Revenue", type=["xlsx","csv"], key="gt_targets")
-        if up is not None and st.button("Validate & Save Targets"):
-            if up.name.endswith(".csv"): raw = pd.read_csv(up)
-            else: raw = pd.read_excel(up)
-            raw = normalize_columns(raw)
-            # Standardize headers (case-insensitive mapping including Title-case from template)
-            cmap = {
-                # Brand
-                "BRAND":"brand_name","BRAND NAME":"brand_name",
-                "Brand":"brand_name","Brand Name":"brand_name",
-                # Category
-                "CATEGORY": "product_category", "PRODUCT CATEGORY": "product_category",
-                "Category": "product_category", "Product Category": "product_category",
-                # Region
-                "REGION":"parent_region", "PARENT REGION":"parent_region",
-                "Region":"parent_region", "Parent Region":"parent_region",
-                # Targets
-                "TARGET VOLUME":"target_volume", "TARGET VOL":"target_volume", "VOLUME TARGET":"target_volume",
-                "Target Volume":"target_volume",
-                "TARGET REVENUE":"target_revenue", "TARGET REV":"target_revenue", "REVENUE TARGET":"target_revenue",
-                "Target Revenue":"target_revenue"
-            }
-            raw.rename(columns=cmap, inplace=True)
-            required = ["brand_name","product_category","parent_region","target_volume","target_revenue"]
-            miss = [c for c in required if c not in raw.columns]
-            if miss:
-                st.error(f"Missing columns: {miss}")
-                st.stop()
-            # Validate regions
-            bad = raw[~raw["parent_region"].astype(str).str.title().isin(PARENT_REGIONS)]
-            if not bad.empty:
-                st.error("Invalid Parent Regions found:")
-                st.dataframe(bad[["brand_name","parent_region"]])
-                st.stop()
-            # Enforce uniqueness
-            raw["parent_region"] = raw["parent_region"].astype(str).str.title()
-            dup = raw.duplicated(["brand_name","product_category","parent_region"], keep=False)
-            if dup.any():
-                st.error("Duplicate Brand+Category+Region combinations detected. Remove duplicates and retry.")
-                st.dataframe(raw[dup])
-                st.stop()
-            # Persist
-            conn = get_connection(); cur = conn.cursor()
-            cur.executemany("""
-                INSERT OR REPLACE INTO gt_brand_targets (brand_name,product_category,parent_region,target_volume,target_revenue,upload_ts)
-                VALUES (?,?,?,?,?,?)
-            """, [(str(r["brand_name"]), str(r["product_category"]), str(r["parent_region"]), float(r["target_volume"] or 0), float(r["target_revenue"] or 0), datetime.now().isoformat()) for _, r in raw.iterrows()])
-            conn.commit(); conn.close()
-            st.success(f"Saved {len(raw)} target rows. Uploaded targets now override any defaults.")
-            # Reload
-            conn = get_connection(); tgt_df = pd.read_sql("SELECT brand_name,product_category,parent_region,target_volume,target_revenue FROM gt_brand_targets", conn); conn.close()
-
-    # Build Brand×Category×Region grid
-    if not sales_df.empty:
-        base_pairs = sales_df[["brand_name", "product_category"]].dropna().drop_duplicates()
-        # Add filtering context pairs if needed, or just use what's in sales_df
-        if sel_brands and "All" not in sel_brands:
-            base_pairs = base_pairs[base_pairs["brand_name"].isin(sel_brands)]
-        if sel_cats and "All" not in sel_cats:
-            base_pairs = base_pairs[base_pairs["product_category"].astype(str).isin(sel_cats)]
-    else:
-        base_pairs = pd.DataFrame(columns=["brand_name", "product_category"])
-
-    # Create grid of (Brand, Category) x Regions
-    grid_list = []
-    for _, row in base_pairs.iterrows():
-        b, c = row["brand_name"], row["product_category"]
-        for r in sel_regions:
-            grid_list.append({"brand_name": b, "product_category": c, "parent_region": r})
-    grid = pd.DataFrame(grid_list) if grid_list else pd.DataFrame(columns=["brand_name", "product_category", "parent_region"])
-
-    actual = sales_df.groupby(["brand_name","product_category","parent_region"], dropna=False).agg(
-        actual_volume=("quantity_cases","sum"), actual_revenue=("value_sold_kes","sum"), customers=("customer_id","nunique")
-    ).reset_index()
-    
-    # Merge
-    perf = grid.merge(actual, on=["brand_name","product_category","parent_region"], how="left").merge(
-        tgt_df, on=["brand_name","product_category","parent_region"], how="left"
-    ).fillna({"actual_volume":0,"actual_revenue":0,"target_volume":0,"target_revenue":0})
-    perf["% Achv"] = (perf["actual_volume"] / perf["target_volume"]).replace([np.inf, np.nan], 0) * 100
-    perf["Volume Drift"] = perf["actual_volume"] - perf["target_volume"]
-    perf["Revenue Drift"] = perf["actual_revenue"] - perf["target_revenue"]
-
-    # KPI Cards
-    tot_target_vol = float(perf["target_volume"].sum()); tot_actual_vol = float(perf["actual_volume"].sum())
-    tot_target_rev = float(perf["target_revenue"].sum()); tot_actual_rev = float(perf["actual_revenue"].sum())
-    days = (pd.to_datetime(date_sel[1]) - pd.to_datetime(date_sel[0])).days + 1 if isinstance(date_sel, tuple) else 1
-    daily_run = (tot_actual_vol / days) if days > 0 else 0
-    forecast_vol = daily_run * days
-    achv = (tot_actual_vol / tot_target_vol * 100) if tot_target_vol > 0 else 0
-    c1,c2,c3,c4,c5 = st.columns(5)
-    c1.metric("Target Vol", f"{tot_target_vol:,.0f}")
-    c2.metric("Actual Vol", f"{tot_actual_vol:,.0f}")
-    c3.metric("% Achv", f"{achv:.1f}%")
-    c4.metric("Drift Vol", f"{(tot_actual_vol - tot_target_vol):,.0f}")
-    c5.metric("Forecast Vol", f"{forecast_vol:,.0f}")
-
-    # Tables
-    st.markdown("### Brand × Category × Region Performance")
-    st.dataframe(perf.sort_values(["brand_name","product_category","parent_region"]).rename(columns={"product_category": "Category", "target_volume":"Target Vol","actual_volume":"Actual Vol","target_revenue":"Target Rev","actual_revenue":"Actual Rev"}), use_container_width=True)
-
-    # Region totals
-    reg_tot = perf.groupby("parent_region").agg(Target_Vol=("target_volume","sum"), Actual_Vol=("actual_volume","sum"), Target_Rev=("target_revenue","sum"), Actual_Rev=("actual_revenue","sum")).reset_index()
-    st.markdown("### Region Totals")
-    st.dataframe(reg_tot, use_container_width=True)
-
-    # Trend (MTD daily)
-    st.markdown("### MTD Trend (Daily Volume)")
-    daily = sales_df.groupby(pd.to_datetime(sales_df["report_date_iso"]).dt.date)["quantity_cases"].sum().reset_index(name="volume")
-    st.line_chart(daily.set_index("report_date_iso") if "report_date_iso" in daily.columns else daily.set_index("index"))
-
-    # Customers
-    st.markdown("### Customer Analysis")
-    total_customers = sales_df["customer_id"].nunique()
-    st.metric("Customers Buying (Selected)", f"{total_customers:,}")
-    by_region = sales_df.groupby("parent_region")["quantity_cases"].sum().sort_values(ascending=False).reset_index()
-    st.bar_chart(by_region.set_index("parent_region"))
+tab_upload = all_tabs[5] if len(all_tabs) > 5 else None
 
 # =========================================================
 # DASHBOARD TAB
