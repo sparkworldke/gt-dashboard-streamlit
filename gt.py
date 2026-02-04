@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 import numpy as np
 import altair as alt
 import hashlib
@@ -45,15 +45,13 @@ def normalize_columns(df):
     )
     return df
 
-def to_iso(date_input):
-    if isinstance(date_input, (date, datetime)):
-        return date_input.strftime("%Y-%m-%d")
+def to_iso(date_str):
     try:
-        return datetime.strptime(date_input, "%d/%m/%Y").strftime("%Y-%m-%d")
-    except (ValueError, TypeError):
+        return datetime.strptime(date_str, "%d/%m/%Y").strftime("%Y-%m-%d")
+    except ValueError:
         # Try handling potential Excel timestamps or other formats if needed
         # For now, strict adherence to DD/MM/YYYY as per requirements
-        raise ValueError(f"Date format must be DD/MM/YYYY or date object. Got: {date_input} ({type(date_input)})")
+        raise ValueError(f"Date format must be DD/MM/YYYY. Got: {date_str}")
 
 def extract_single_date(series, label):
     # Fix UserWarning: Parsing dates in %Y-%m-%d %H:%M:%S format when dayfirst=True was specified.
@@ -266,22 +264,6 @@ def init_db():
         target_revenue REAL,
         upload_ts TEXT,
         PRIMARY KEY (brand_name, product_category, parent_region)
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS incentive_targets_detail (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        start_date TEXT,
-        end_date TEXT,
-        sales_rep_name TEXT,
-        region_name TEXT,
-        outlet_category TEXT,
-        target_vol_tp_serv REAL,
-        target_abv REAL,
-        target_lppc REAL,
-        created_at TEXT,
-        UNIQUE(start_date, sales_rep_name, outlet_category)
     );
     """)
 
@@ -562,8 +544,8 @@ if activity_all.empty:
     # But still allow the app to render the Upload tab
     activity_all = pd.DataFrame(columns=["report_date_iso", "region_name", "sales_rep_name", "customers_on_pjp", "new_customers_mapped", "sales_rep_id", "actual_visits"])
     orders_all = pd.DataFrame(columns=["report_date_iso", "sales_rep_id", "customer_id", "order_value_kes", "lines_count"])
-    lines_all = pd.DataFrame(columns=["report_date_iso", "region_name", "sales_rep_name", "product_sku", "product_code", "brand_name", "customer_id", "value_sold_kes", "product_category", "customer_category", "quantity_cases"])
-    mill_all = pd.DataFrame(columns=["report_date_iso", "region_name", "sales_rep_name", "product_sku", "product_code", "brand_name", "customer_id", "value_sold_kes", "product_category", "customer_category", "quantity_cases"])
+    lines_all = pd.DataFrame(columns=["report_date_iso", "region_name", "sales_rep_name", "product_sku", "product_code", "brand_name", "customer_id", "value_sold_kes"])
+    mill_all = pd.DataFrame(columns=["report_date_iso", "region_name", "sales_rep_name", "product_sku", "product_code", "brand_name", "customer_id", "value_sold_kes"])
 else:
     activity_all["report_date_iso"] = pd.to_datetime(activity_all["report_date_iso"])
     orders_all["report_date_iso"] = pd.to_datetime(orders_all["report_date_iso"])
@@ -687,7 +669,7 @@ def calculate_metrics(af_curr, of_curr):
 # =========================================================
 # TABS
 # =========================================================
-tabs_list = ["📊 Dashboard", "📉 LPPC", "🏭 Mill Products", "👥 Customers", "🧠 Insights", "💰 Incentives"]
+tabs_list = ["📊 Dashboard", "📉 LPPC", "🏭 Mill Products", "👥 Customers", "🧠 Insights"]
 
 if st.session_state.get('role') == 'super_admin':
     tabs_list.append("📥 Upload")
@@ -701,14 +683,13 @@ tab_lppc = all_tabs[1]
 tab_mill = all_tabs[2]
 tab_customers = all_tabs[3]
 tab_insights = all_tabs[4]
-tab_incentives = all_tabs[5]
 
 if st.session_state.get('role') == 'super_admin':
-    tab_upload = all_tabs[6]
-    tab_gt = all_tabs[7]
+    tab_upload = all_tabs[5]
+    tab_gt = all_tabs[6]
 else:
     tab_upload = None
-    tab_gt = all_tabs[6]
+    tab_gt = all_tabs[5]
 
 # =========================================================
 # GT PERFORMANCE TAB
@@ -885,7 +866,7 @@ with tab_gt:
     # KPI Cards
     tot_target_vol = float(perf["target_volume"].sum()); tot_actual_vol = float(perf["actual_volume"].sum())
     tot_target_rev = float(perf["target_revenue"].sum()); tot_actual_rev = float(perf["actual_revenue"].sum())
-    days = (date_sel[1] - date_sel[0]).days + 1 if isinstance(date_sel, tuple) and len(date_sel) > 1 else 1
+    days = (pd.to_datetime(date_sel[1]) - pd.to_datetime(date_sel[0])).days + 1 if isinstance(date_sel, tuple) else 1
     daily_run = (tot_actual_vol / days) if days > 0 else 0
     forecast_vol = daily_run * days
     achv = (tot_actual_vol / tot_target_vol * 100) if tot_target_vol > 0 else 0
@@ -2365,366 +2346,6 @@ with tab_insights:
                 else:
                     for r in recs:
                         st.write(r)
-
-# =========================================================
-# INCENTIVES TAB
-# =========================================================
-with tab_incentives:
-    st.header("💰 Incentives Management")
-
-    # --- 1. Target Management ---
-    with st.expander("🎯 Target Management (Upload / Download)", expanded=True):
-        col_t1, col_t2 = st.columns(2)
-        
-        with col_t1:
-            st.subheader("1. Download Template")
-            st.caption("Download a template with all Reps and Outlet Categories.")
-            
-            if st.button("Download Targets Template"):
-                # Get Reps and Regions
-                reps_regs = activity_all[["sales_rep_name", "region_name"]].drop_duplicates()
-                if reps_regs.empty:
-                    reps_regs = pd.DataFrame({"sales_rep_name": ["Example Rep"], "region_name": ["Nairobi"]})
-                
-                # Get Outlet Categories
-                cats = lines_all["customer_category"].dropna().unique() if not lines_all.empty else ["Grocery", "Wholesale", "LMT"]
-                
-                # Create Cartesian Product (Rep x Category)
-                templ_rows = []
-                for _, row in reps_regs.iterrows():
-                    for cat in cats:
-                        templ_rows.append({
-                            "sales_rep_name": row["sales_rep_name"],
-                            "region_name": row["region_name"],
-                            "outlet_category": cat,
-                            "target_vol_tp_serv": "",
-                            "target_abv": "",
-                            "target_lppc": ""
-                        })
-                
-                templ_df = pd.DataFrame(templ_rows)
-                csv = templ_df.to_csv(index=False).encode('utf-8')
-                
-                st.download_button(
-                    "Download CSV Template",
-                    csv,
-                    "incentive_targets_template.csv",
-                    "text/csv",
-                    key='download-csv'
-                )
-
-        with col_t2:
-            st.subheader("2. Upload Targets")
-            st.caption("Upload the filled CSV template.")
-            
-            # Date Selection for Targets
-            # Assuming targets are set for a period. Let's allow picking a start date.
-            # Default to 1st of current month
-            today = datetime.today()
-            default_start = today.replace(day=1)
-            # Default end is +2 months (since "2-month increments" mentioned)
-            # But usually targets are monthly or quarterly. Let's ask for Start and End.
-            
-            t_start = st.date_input("Target Start Date", value=default_start)
-            t_end = st.date_input("Target End Date", value=(default_start + timedelta(days=60)))
-
-            target_file = st.file_uploader("Upload Targets CSV", type=["csv"])
-            
-            if target_file and st.button("Save Targets"):
-                try:
-                    t_df = pd.read_csv(target_file)
-                    # Normalize columns
-                    t_df.columns = [c.lower().strip().replace(" ", "_") for c in t_df.columns]
-                    
-                    # Validate required columns
-                    req_cols = ["sales_rep_name", "outlet_category", "target_vol_tp_serv", "target_abv", "target_lppc"]
-                    if not all(c in t_df.columns for c in req_cols):
-                        st.error(f"Missing required columns: {req_cols}")
-                    else:
-                        # Save to DB
-                        conn = get_connection()
-                        cur = conn.cursor()
-                        
-                        count = 0
-                        for _, row in t_df.iterrows():
-                            # Clean numeric values
-                            vol = pd.to_numeric(row.get("target_vol_tp_serv"), errors='coerce') or 0
-                            abv = pd.to_numeric(row.get("target_abv"), errors='coerce') or 0
-                            lppc = pd.to_numeric(row.get("target_lppc"), errors='coerce') or 0
-                            
-                            # Upsert logic (Delete existing first to avoid unique constraint error on update, or use REPLACE INTO)
-                            # Using DELETE + INSERT to ensure clean update
-                            cur.execute("""
-                                DELETE FROM incentive_targets_detail 
-                                WHERE start_date = ? AND sales_rep_name = ? AND outlet_category = ?
-                            """, (to_iso(t_start), row["sales_rep_name"], row["outlet_category"]))
-                            
-                            cur.execute("""
-                                INSERT INTO incentive_targets_detail 
-                                (start_date, end_date, sales_rep_name, region_name, outlet_category, 
-                                target_vol_tp_serv, target_abv, target_lppc, created_at)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, (
-                                to_iso(t_start), 
-                                to_iso(t_end), 
-                                row["sales_rep_name"], 
-                                row.get("region_name", ""), 
-                                row["outlet_category"], 
-                                vol, abv, lppc, 
-                                datetime.now().isoformat()
-                            ))
-                            count += 1
-                        
-                        conn.commit()
-                        conn.close()
-                        st.success(f"✅ Successfully saved {count} target entries for period starting {t_start}.")
-                        
-                except Exception as e:
-                    st.error(f"Error processing file: {e}")
-
-    st.markdown("---")
-
-    # --- 2. Performance Dashboard ---
-    st.subheader("🏆 Incentive Performance")
-    
-    # Filter Controls
-    i_col1, i_col2 = st.columns(2)
-    with i_col1:
-        # Rep Selection (Reuse existing if possible, but tab specific might be better)
-        i_reps = ["All"] + sorted(activity_all["sales_rep_name"].dropna().unique())
-        i_selected_rep = st.selectbox("Filter Rep", i_reps, key="inc_rep")
-        
-    with i_col2:
-        # Period Selection (Should match target periods, but flexible)
-        # Default to current month
-        pass # Using the main period selector from sidebar/top for actuals might be confusing if targets are 2-monthly.
-             # But let's stick to the global date selector for "Actuals" to compare against targets active in that period.
-    
-    # Logic:
-    # 1. Get Targets active for the selected period (overlap?)
-    #    Let's find targets where start_date <= selected_date <= end_date.
-    #    Since global selector is a range, we might pick targets that overlap.
-    #    Simpler: Pick the latest target set for the Rep.
-    
-    conn = get_connection()
-    targets_db = pd.read_sql("SELECT * FROM incentive_targets_detail", conn)
-    conn.close()
-    
-    if targets_db.empty:
-        st.warning("No targets found. Please upload targets above.")
-        targets_df = pd.DataFrame(columns=["sales_rep_name", "outlet_category", "target_vol_tp_serv", "target_abv", "target_lppc"])
-    else:
-        # Filter targets for selected Rep
-        if i_selected_rep != "All":
-            targets_df = targets_db[targets_db["sales_rep_name"] == i_selected_rep]
-        else:
-            targets_df = targets_db
-            
-        # Deduplicate if multiple periods exist - take the most recent start_date
-        if not targets_df.empty:
-            targets_df = targets_df.sort_values("start_date", ascending=False).drop_duplicates(subset=["sales_rep_name", "outlet_category"])
-
-    # 2. Get Actuals (TP/Serviette Only for Volume?)
-    #    "25% volume... for TP/Serviette categories"
-    #    We'll use lines_all filtered by global date selector
-    
-    # Filter for Rep
-    inc_lf = lf.copy() # Global filtered lines
-    if i_selected_rep != "All":
-        inc_lf = inc_lf[inc_lf["sales_rep_name"] == i_selected_rep]
-    
-    # SAFETY: Ensure product_category exists to prevent KeyError
-    if "product_category" not in inc_lf.columns:
-        inc_lf["product_category"] = "General"
-    if "customer_category" not in inc_lf.columns:
-        inc_lf["customer_category"] = "General"
-        
-    # Calculate Actuals by Rep + Category
-    # Filter for TP/Serviette for Volume?
-    # Assuming "TOILET PAPER" covers TP and Serviette based on data inspection.
-    tp_serv_mask = inc_lf["product_category"].astype(str).str.contains("TOILET PAPER|SERVIETTE", case=False, regex=True)
-    inc_lf_vol = inc_lf[tp_serv_mask]
-    
-    # Group by Rep, Category
-    # We need all categories, not just TP ones, for LPPC and ABV?
-    # "1000 KES/LPPC channel". "2000 KES ABV bonus".
-    # Usually ABV is total basket. LPPC is total portfolio?
-    # But user said "for TP/Serviette categories" in the beginning of that sentence.
-    # "Add incentives tab with specific logic... for TP/Serviette categories: ... +1 LPPC per channel".
-    # It implies the whole scheme is for TP/Serviette.
-    # So I will calculate metrics based on TP/Serviette items only.
-    
-    # Volume Actuals (Sum Quantity)
-    actual_vol = inc_lf_vol.groupby(["sales_rep_name", "customer_category"])["quantity_cases"].sum().reset_index()
-    actual_vol.rename(columns={"quantity_cases": "actual_vol_tp_serv"}, inplace=True)
-    
-    # ABV Actuals (Value / Orders)
-    # Orders containing TP/Serv
-    # We need to find orders that have these products.
-    # inc_lf_vol contains lines. Group by Order ID to get order value?
-    # lines_all has 'value_sold_kes'.
-    # We should probably take the SUM of value for TP/Serv items and divide by count of orders containing TP/Serv items.
-    # Or is ABV total order value? Usually "Average Basket Value" is total invoice value.
-    # But if the incentive is on TP/Serv, maybe it's "Average TP/Serv Value per Order"?
-    # Given "2000 KES ABV bonus", it's a high bonus. Likely total basket.
-    # But let's stick to the filtered lines if "TP/Serviette categories" applies to all.
-    # Let's calculate BOTH or assume Total Basket for ABV is standard.
-    # However, for specific category incentives, usually it's "Sell more TP".
-    # I will calculate ABV of the *filtered products*.
-    
-    # Group by Rep, Customer Category
-    # Need Orders Count
-    orders_tp = inc_lf_vol.groupby(["sales_rep_name", "customer_category", "customer_id", "report_date_iso"]).agg(
-        val=("value_sold_kes", "sum")
-    ).reset_index()
-    
-    actual_abv_agg = orders_tp.groupby(["sales_rep_name", "customer_category"]).agg(
-        total_val=("val", "sum"),
-        orders_count=("val", "count")
-    ).reset_index()
-    actual_abv_agg["actual_abv"] = actual_abv_agg["total_val"] / actual_abv_agg["orders_count"]
-    
-    # LPPC Actuals (Lines / Orders)
-    # Lines of TP/Serv items per Order containing TP/Serv items
-    lines_tp = inc_lf_vol.groupby(["sales_rep_name", "customer_category", "customer_id", "report_date_iso"])["product_code"].nunique().reset_index()
-    lines_tp.rename(columns={"product_code": "lines_count"}, inplace=True)
-    
-    actual_lppc_agg = lines_tp.groupby(["sales_rep_name", "customer_category"])["lines_count"].mean().reset_index()
-    actual_lppc_agg.rename(columns={"lines_count": "actual_lppc"}, inplace=True)
-    
-    # Merge Actuals
-    actuals_df = pd.merge(actual_vol, actual_abv_agg[["sales_rep_name", "customer_category", "actual_abv"]], on=["sales_rep_name", "customer_category"], how="outer")
-    actuals_df = pd.merge(actuals_df, actual_lppc_agg, on=["sales_rep_name", "customer_category"], how="outer")
-    actuals_df = actuals_df.fillna(0)
-    
-    # Merge with Targets
-    # Rename for merge
-    targets_prep = targets_df.rename(columns={"outlet_category": "customer_category"})
-    
-    # Ensure Reps are present - use outer join to include Actuals even if no Target exists
-    full_df = pd.merge(targets_prep, actuals_df, on=["sales_rep_name", "customer_category"], how="outer")
-    
-    # Fill NaN actuals with 0 (for reps/cats that have targets but no sales)
-    full_df[["actual_vol_tp_serv", "actual_abv", "actual_lppc"]] = full_df[["actual_vol_tp_serv", "actual_abv", "actual_lppc"]].fillna(0)
-    # Also fill NaN targets with 0 to prevent comparison errors
-    full_df[["target_vol_tp_serv", "target_abv", "target_lppc"]] = full_df[["target_vol_tp_serv", "target_abv", "target_lppc"]].fillna(0)
-    # Also fill NaN targets with 0 to prevent comparison errors
-    full_df[["target_vol_tp_serv", "target_abv", "target_lppc"]] = full_df[["target_vol_tp_serv", "target_abv", "target_lppc"]].fillna(0)
-    
-    # Calculate Earnings
-    # 2 KES/bale volume
-    full_df["earnings_vol"] = full_df["actual_vol_tp_serv"] * 2
-    
-    # 2000 KES ABV bonus (if target met)
-    full_df["earnings_abv"] = full_df.apply(lambda x: 2000 if (x["target_abv"] > 0 and x["actual_abv"] >= x["target_abv"]) else 0, axis=1)
-    
-    # 1000 KES/LPPC channel (if target met)
-    full_df["earnings_lppc"] = full_df.apply(lambda x: 1000 if (x["target_lppc"] > 0 and x["actual_lppc"] >= x["target_lppc"]) else 0, axis=1)
-    
-    full_df["total_earnings"] = full_df["earnings_vol"] + full_df["earnings_abv"] + full_df["earnings_lppc"]
-    
-    # Display
-    if not full_df.empty:
-        # Formatting
-        st.write("### 📊 Performance vs Targets")
-        
-        # Summary metrics
-        total_earnings = full_df["total_earnings"].sum()
-        st.metric("Total Projected Earnings (Selected Reps)", f"KES {total_earnings:,.0f}")
-        
-        # Detailed Table
-        disp_cols = [
-            "sales_rep_name", "customer_category", 
-            "target_vol_tp_serv", "actual_vol_tp_serv", "earnings_vol",
-            "target_abv", "actual_abv", "earnings_abv",
-            "target_lppc", "actual_lppc", "earnings_lppc",
-            "total_earnings"
-        ]
-        
-        # Rename for display
-        disp_df = full_df[disp_cols].rename(columns={
-            "sales_rep_name": "Rep",
-            "customer_category": "Category",
-            "target_vol_tp_serv": "Tgt Vol",
-            "actual_vol_tp_serv": "Act Vol",
-            "earnings_vol": "Earn Vol",
-            "target_abv": "Tgt ABV",
-            "actual_abv": "Act ABV",
-            "earnings_abv": "Earn ABV",
-            "target_lppc": "Tgt LPPC",
-            "actual_lppc": "Act LPPC",
-            "earnings_lppc": "Earn LPPC",
-            "total_earnings": "Total Earn"
-        })
-        
-        st.dataframe(
-            disp_df.style.format({
-                "Tgt Vol": "{:,.0f}", "Act Vol": "{:,.0f}", "Earn Vol": "{:,.0f}",
-                "Tgt ABV": "{:,.0f}", "Act ABV": "{:,.0f}", "Earn ABV": "{:,.0f}",
-                "Tgt LPPC": "{:.2f}", "Act LPPC": "{:.2f}", "Earn LPPC": "{:,.0f}",
-                "Total Earn": "{:,.0f}"
-            }),
-            use_container_width=True
-        )
-        
-        # Auto-Generate Next Period Button
-        st.markdown("### ⏩ Next Period Planning")
-        st.caption("Generate targets for next period based on rule: +25% Volume, +15% ABV, +1 LPPC.")
-        
-        col_gen1, col_gen2 = st.columns(2)
-        with col_gen1:
-            next_start_date = st.date_input("Next Period Start", value=(datetime.today() + timedelta(days=30)).replace(day=1))
-        
-        if st.button("Generate Next Period Targets"):
-            # Logic: Take CURRENT targets (or actuals? "2-month target increments" usually implies Target -> Target)
-            # Assuming Target -> Target growth.
-            
-            next_targets = targets_df.copy()
-            next_targets["start_date"] = to_iso(next_start_date)
-            # End date? Let's say +2 months
-            next_end = next_start_date + timedelta(days=60)
-            next_targets["end_date"] = to_iso(next_end)
-            
-            # Apply Increments
-            # Volume + 25%
-            next_targets["target_vol_tp_serv"] = next_targets["target_vol_tp_serv"] * 1.25
-            # ABV + 15%
-            next_targets["target_abv"] = next_targets["target_abv"] * 1.15
-            # LPPC + 1
-            next_targets["target_lppc"] = next_targets["target_lppc"] + 1.0
-            
-            next_targets["created_at"] = datetime.now().isoformat()
-            
-            # Save to DB
-            conn = get_connection()
-            cur = conn.cursor()
-            
-            n_count = 0
-            for _, row in next_targets.iterrows():
-                 cur.execute("""
-                    DELETE FROM incentive_targets_detail 
-                    WHERE start_date = ? AND sales_rep_name = ? AND outlet_category = ?
-                """, (row["start_date"], row["sales_rep_name"], row["outlet_category"]))
-                
-                 cur.execute("""
-                    INSERT INTO incentive_targets_detail 
-                    (start_date, end_date, sales_rep_name, region_name, outlet_category, 
-                    target_vol_tp_serv, target_abv, target_lppc, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    row["start_date"], row["end_date"], 
-                    row["sales_rep_name"], row["region_name"], row["outlet_category"],
-                    row["target_vol_tp_serv"], row["target_abv"], row["target_lppc"],
-                    row["created_at"]
-                ))
-                 n_count += 1
-            
-            conn.commit()
-            conn.close()
-            st.success(f"Generated and saved {n_count} targets for {next_start_date}!")
-            
-    else:
-        st.info("No targets found for the selected view.")
 
 # =========================================================
 # UPLOAD TAB
